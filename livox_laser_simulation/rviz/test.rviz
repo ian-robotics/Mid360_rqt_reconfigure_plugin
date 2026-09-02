@@ -6,7 +6,7 @@ Visualization Manager:
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
-    Fixed Frame: livox_link
+    Fixed Frame: odom
     Frame Rate: 30
   Displays:
     - Class: rviz_default_plugins/Grid
@@ -30,6 +30,7 @@ Visualization Manager:
       Autocompute Intensity Bounds: true
       Queue Size: 10
       Use Fixed Frame: true
+      Decay Time: 60
   Tools:
     - Class: rviz_default_plugins/Interact
       Hide Inactive Objects: true

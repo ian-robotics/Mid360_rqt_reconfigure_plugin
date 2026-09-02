@@ -11,8 +11,10 @@
 
   <depend>geometry_msgs</depend>
   <depend>rclcpp</depend>
+  <depend>rcl_interfaces</depend>
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
+  <depend>tf2_msgs</depend>
   <depend>gz-common5</depend>
   <depend>gz-msgs10</depend>
   <depend>gz-plugin2</depend>
@@ -21,7 +23,10 @@
 
   <exec_depend>rosidl_default_runtime</exec_depend>
   <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
   <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>ros_gz_bridge</exec_depend>
+  <exec_depend>turtlebot3_teleop</exec_depend>
   <member_of_group>rosidl_interface_packages</member_of_group>
 
   <export>

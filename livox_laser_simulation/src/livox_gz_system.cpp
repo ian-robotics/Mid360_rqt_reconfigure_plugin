@@ -2,14 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -18,13 +22,19 @@
 #include <gz/msgs/laserscan.pb.h>
 #include <gz/plugin/Register.hh>
 #include <gz/sim/System.hh>
+#include <gz/sim/components/Pose.hh>
+#include <gz/sim/Entity.hh>
+#include <gz/sim/EntityComponentManager.hh>
 #include <gz/transport/Node.hh>
 
 #include <rclcpp/rclcpp.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
 #include <sensor_msgs/msg/point_cloud.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/point_field.hpp>
+#include <tf2_msgs/msg/tf_message.hpp>
 
+#include "livox_laser_simulation/lidar_reconfig.hpp"
 #include "livox_laser_simulation/msg/custom_msg.hpp"
 #include "livox_laser_simulation/msg/custom_point.hpp"
 
@@ -114,11 +124,26 @@ void WriteDouble(std::vector<uint8_t> &data, size_t offset, double value)
 /// Gazebo Sim LiDAR uses a rectangular angular grid, while Mid-360's pattern
 /// is an ordered list of arbitrary rays. The source LiDAR must therefore span
 /// the Mid-360's field of view; each CSV ray picks the closest grid sample.
+///
+/// Every SDF knob is re-exposed as a ROS 2 parameter, so `ros2 param set` or
+/// rqt_reconfigure can retune the output (point count, range filter, scan
+/// pattern) without editing the SDF file or restarting the simulation.
 class LivoxGzSystem final : public gz::sim::System,
-                            public gz::sim::ISystemConfigure
+                            public gz::sim::ISystemConfigure,
+                            public gz::sim::ISystemPostUpdate
 {
 public:
-  void Configure(const gz::sim::Entity &,
+  ~LivoxGzSystem() override
+  {
+    if (this->executor_ != nullptr) {
+      this->executor_->cancel();
+    }
+    if (this->spin_thread_.joinable()) {
+      this->spin_thread_.join();
+    }
+  }
+
+  void Configure(const gz::sim::Entity &entity,
       const std::shared_ptr<const sdf::Element> &sdf,
       gz::sim::EntityComponentManager &,
       gz::sim::EventManager &) override
@@ -126,20 +151,30 @@ public:
     if (!rclcpp::ok()) {
       rclcpp::init(0, nullptr);
     }
+    this->entity_ = entity;
 
     this->frame_id_ = sdf->Get<std::string>("frame_name", "livox_link").first;
     this->ros_topic_ = sdf->Get<std::string>("ros_topic", "/livox/lidar").first;
     this->point_type_ = static_cast<uint16_t>(sdf->Get<int>(
         "publish_pointcloud_type", static_cast<int>(kPointCloud2Xyzrtlt)).first);
-    this->points_per_scan_ = std::max<uint32_t>(1,
+    this->params_.samples = std::max<uint32_t>(1,
         sdf->Get<uint32_t>("samples", 18000U).first);
-    this->downsample_ = std::max<uint32_t>(1,
+    this->params_.downsample = std::max<uint32_t>(1,
         sdf->Get<uint32_t>("downsample", 1U).first);
-    this->publish_max_range_ = sdf->Get<bool>("publish_max_range", false).first;
+    this->params_.min_range = sdf->Get<double>("min_range", 0.1).first;
+    this->params_.max_range = sdf->Get<double>("max_range", 45.0).first;
+    this->params_.publish_max_range = sdf->Get<bool>("publish_max_range", false).first;
 
     const auto node_name = sdf->Get<std::string>("ros_node_name",
         "livox_mid360_gz").first;
-    this->ros_node_ = std::make_shared<rclcpp::Node>(node_name);
+    // Stamp the clouds with the simulation clock so that RViz, the bridged
+    // /tf (also sim-stamped) and the point clouds share one time base.
+    // Requires the gz /clock topic to be bridged to ROS; without /clock the
+    // node clock stays at 0.
+    rclcpp::NodeOptions node_options;
+    node_options.append_parameter_override("use_sim_time",
+        sdf->Get<bool>("use_sim_time", true).first);
+    this->ros_node_ = std::make_shared<rclcpp::Node>(node_name, node_options);
     switch (this->point_type_) {
       case kPointCloud:
         this->point_cloud_pub_ = this->ros_node_->create_publisher<sensor_msgs::msg::PointCloud>(
@@ -160,9 +195,9 @@ public:
         return;
     }
 
-    std::string csv_path = sdf->Get<std::string>("csv_file",
+    this->params_.csv_file = sdf->Get<std::string>("csv_file",
         "model://Mid360/scan_mode/mid360-real-centr.csv").first;
-    csv_path = ResolveCsvPath(csv_path);
+    const std::string csv_path = ResolveCsvPath(this->params_.csv_file);
     if (!ParseCsv(csv_path, this->pattern_)) {
       RCLCPP_ERROR(this->ros_node_->get_logger(),
         "Unable to read Mid-360 scan CSV: %s", csv_path.c_str());
@@ -180,9 +215,36 @@ public:
         "Could not subscribe to Gazebo LiDAR topic: %s", this->gz_scan_topic_.c_str());
       return;
     }
+
+    // Expose the SDF knobs as ROS 2 parameters for dynamic reconfiguration.
+    DeclareLidarParameters(this->ros_node_, this->params_);
+    this->param_callback_handle_ =
+      this->ros_node_->add_on_set_parameters_callback(
+      [this](const std::vector<rclcpp::Parameter> &parameters) {
+        return this->OnParametersChanged(parameters);
+      });
+
+    // Parameter services only answer while an executor spins the node. The
+    // scan data itself still arrives on the Gazebo transport thread, so the
+    // shared state is guarded by params_mutex_.
+    this->executor_ = std::make_shared<rclcpp::executors::SingleThreadedExecutor>();
+    this->executor_->add_node(this->ros_node_);
+    this->spin_thread_ = std::thread([this]() { this->executor_->spin(); });
+
+    // Optional ground-truth TF publisher: wheel odometry is meaningless for
+    // skid-steer robots (measured: 168 deg yaw error on a single turn), so
+    // in simulation publish the true model pose read from the ECM in
+    // PostUpdate. Enabled by <tf_child_frame> in the plugin SDF.
+    this->tf_child_frame_ = sdf->Get<std::string>("tf_child_frame", "").first;
+    if (!this->tf_child_frame_.empty()) {
+      this->tf_pub_ = this->ros_node_->create_publisher<tf2_msgs::msg::TFMessage>("/tf", 10);
+      RCLCPP_INFO(this->ros_node_->get_logger(),
+        "Publishing ground-truth TF: odom -> %s", this->tf_child_frame_.c_str());
+    }
+
     RCLCPP_INFO(this->ros_node_->get_logger(),
       "Mid-360 adapter ready: %zu CSV rays, %u output rays / scan, input=%s, output=%s",
-      this->pattern_.size(), this->points_per_scan_, this->gz_scan_topic_.c_str(),
+      this->pattern_.size(), this->params_.samples, this->gz_scan_topic_.c_str(),
       this->ros_topic_.c_str());
   }
 
@@ -197,9 +259,89 @@ private:
     uint32_t offset_time;
   };
 
+  rcl_interfaces::msg::SetParametersResult OnParametersChanged(
+      const std::vector<rclcpp::Parameter> &parameters)
+  {
+    // Fold the update into a candidate first; shared state is only touched
+    // after every check passed, so a rejected update changes nothing.
+    LidarDynamicParams candidate;
+    {
+      std::lock_guard<std::mutex> lock(this->params_mutex_);
+      candidate = this->params_;
+    }
+    bool csv_changed = false;
+    auto result = UpdateLidarParameters(parameters, candidate, &csv_changed);
+    if (!result.successful) {
+      return result;
+    }
+    std::vector<ScanPoint> pattern;
+    if (csv_changed) {
+      const std::string csv_path = ResolveCsvPath(candidate.csv_file);
+      if (!ParseCsv(csv_path, pattern)) {
+        result.successful = false;
+        result.reason = "unable to read scan pattern: " + candidate.csv_file;
+        return result;
+      }
+    }
+    {
+      std::lock_guard<std::mutex> lock(this->params_mutex_);
+      this->params_ = candidate;
+      if (csv_changed) {
+        this->pattern_ = std::move(pattern);
+      }
+      // Restart the pattern cursor so the next scan starts from ray zero.
+      this->start_index_ = 0;
+    }
+    RCLCPP_INFO(this->ros_node_->get_logger(),
+      "Reconfigured: samples=%u, downsample=%u, min_range=%.2f, max_range=%.2f, csv_file=%s",
+      candidate.samples, candidate.downsample, candidate.min_range,
+      candidate.max_range, candidate.csv_file.c_str());
+    return result;
+  }
+
+  void PostUpdate(const gz::sim::UpdateInfo &info,
+      const gz::sim::EntityComponentManager &ecm) override
+  {
+    if (!this->tf_pub_) {
+      return;
+    }
+    const auto *pose = ecm.Component<gz::sim::components::Pose>(this->entity_);
+    if (pose == nullptr) {
+      return;
+    }
+    // Throttle to ~30 Hz; stamped with the exact simulation time.
+    const double sim_s = std::chrono::duration<double>(info.simTime).count();
+    if (sim_s - this->tf_last_pub_s_ < 0.033 && this->tf_last_pub_s_ >= 0.0) {
+      return;
+    }
+    this->tf_last_pub_s_ = sim_s;
+
+    tf2_msgs::msg::TFMessage msg;
+    geometry_msgs::msg::TransformStamped t;
+    const int64_t nsec = info.simTime.count();
+    t.header.stamp.sec = static_cast<int32_t>(nsec / 1000000000LL);
+    t.header.stamp.nanosec = static_cast<uint32_t>(nsec % 1000000000LL);
+    t.header.frame_id = "odom";
+    t.child_frame_id = this->tf_child_frame_;
+    const auto &p = pose->Data();
+    t.transform.translation.x = p.Pos().X();
+    t.transform.translation.y = p.Pos().Y();
+    t.transform.translation.z = p.Pos().Z();
+    t.transform.rotation.x = p.Rot().X();
+    t.transform.rotation.y = p.Rot().Y();
+    t.transform.rotation.z = p.Rot().Z();
+    t.transform.rotation.w = p.Rot().W();
+    msg.transforms.push_back(std::move(t));
+    this->tf_pub_->publish(msg);
+  }
+
   void OnScan(const gz::msgs::LaserScan &scan)
   {
-    if (this->pattern_.empty() || !this->ros_node_) {
+    if (!this->ros_node_) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(this->params_mutex_);
+    if (this->pattern_.empty()) {
       return;
     }
     const uint32_t horizontal_count = scan.count();
@@ -208,11 +350,19 @@ private:
       return;
     }
 
-    const auto stamp = this->ros_node_->now();
+    // Stamp the cloud with the frame's capture time carried by the gz
+    // message, not with "now": the processing and /clock relay lag would
+    // otherwise associate each frame with a pose from the wrong instant and
+    // smear the accumulated cloud while the vehicle moves (a rotating car
+    // turns its own walls into circles).
+    const gz::msgs::Time &scan_time = scan.header().stamp();
+    const rclcpp::Time stamp = (scan_time.sec() == 0 && scan_time.nsec() == 0)
+      ? this->ros_node_->now()
+      : rclcpp::Time(scan_time.sec(), scan_time.nsec(), RCL_ROS_TIME);
     const size_t pattern_size = this->pattern_.size();
-    const size_t requested = std::min<size_t>(this->points_per_scan_, pattern_size);
+    const size_t requested = std::min<size_t>(this->params_.samples, pattern_size);
     std::vector<OutputPoint> output;
-    output.reserve(requested / this->downsample_ + 1);
+    output.reserve(requested / this->params_.downsample + 1);
 
     const double horizontal_step = scan.angle_step();
     const double vertical_step = scan.vertical_angle_step();
@@ -222,7 +372,7 @@ private:
       return;
     }
 
-    for (size_t i = 0; i < requested; i += this->downsample_) {
+    for (size_t i = 0; i < requested; i += this->params_.downsample) {
       const auto &ray = this->pattern_[(this->start_index_ + i) % pattern_size];
       const long horizontal = std::lround((ray.azimuth - scan.angle_min()) / horizontal_step);
       const long vertical = std::lround((ray.zenith - scan.vertical_angle_min()) / vertical_step);
@@ -233,11 +383,23 @@ private:
       if (scan_index >= static_cast<size_t>(scan.ranges_size())) {
         continue;
       }
-      const double range = scan.ranges(static_cast<int>(scan_index));
-      if (!std::isfinite(range) || range < scan.range_min() ||
-          (!this->publish_max_range_ && range >= scan.range_max())) {
+      double range = scan.ranges(static_cast<int>(scan_index));
+      if (!std::isfinite(range)){
+        if (!this->params_.publish_max_range){
+          continue;
+        }
+        range = scan.range_max();
+      }
+      if (range < this->params_.min_range || range > this->params_.max_range) {
         continue;
       }
+      /*
+      if (!std::isfinite(range) || range < this->params_.min_range ||
+          range > this->params_.max_range ||
+          (!this->params_.publish_max_range && range >= scan.range_max())) {
+        continue;
+      }
+        */
 
       const double cos_pitch = std::cos(ray.zenith);
       const float intensity = scan_index < static_cast<size_t>(scan.intensities_size()) ?
@@ -332,8 +494,18 @@ private:
     this->point_cloud2_pub_->publish(cloud);
   }
 
+  std::mutex params_mutex_;
   gz::transport::Node gz_node_;
   rclcpp::Node::SharedPtr ros_node_;
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_callback_handle_;
+  rclcpp::executors::SingleThreadedExecutor::SharedPtr executor_;
+  std::thread spin_thread_;
+
+  // Ground-truth TF (optional, enabled by <tf_child_frame>).
+  gz::sim::Entity entity_{gz::sim::kNullEntity};
+  double tf_last_pub_s_{-1.0};
+  rclcpp::Publisher<tf2_msgs::msg::TFMessage>::SharedPtr tf_pub_;
+  std::string tf_child_frame_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud>::SharedPtr point_cloud_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr point_cloud2_pub_;
   rclcpp::Publisher<CustomMsg>::SharedPtr custom_pub_;
@@ -342,15 +514,14 @@ private:
   std::string ros_topic_;
   std::string gz_scan_topic_;
   size_t start_index_{0};
-  uint32_t points_per_scan_{18000};
-  uint32_t downsample_{1};
+  LidarDynamicParams params_;
   uint16_t point_type_{kPointCloud2Xyzrtlt};
-  bool publish_max_range_{false};
 };
 }  // namespace livox_laser_simulation
 
 GZ_ADD_PLUGIN(livox_laser_simulation::LivoxGzSystem,
   gz::sim::System,
-  gz::sim::ISystemConfigure)
+  gz::sim::ISystemConfigure,
+  gz::sim::ISystemPostUpdate)
 GZ_ADD_PLUGIN_ALIAS(livox_laser_simulation::LivoxGzSystem,
   "livox_laser_simulation::LivoxGzSystem")

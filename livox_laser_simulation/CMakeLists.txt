@@ -11,9 +11,11 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rcl_interfaces REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(tf2_msgs REQUIRED)
 find_package(gz-common5 REQUIRED)
 find_package(gz-msgs10 REQUIRED)
 find_package(gz-plugin2 REQUIRED)
@@ -32,7 +34,7 @@ add_library(livox_laser_simulation_gz SHARED
 target_compile_features(livox_laser_simulation_gz PUBLIC cxx_std_17)
 target_include_directories(livox_laser_simulation_gz PRIVATE include)
 ament_target_dependencies(livox_laser_simulation_gz
-  geometry_msgs rclcpp sensor_msgs std_msgs
+  geometry_msgs rclcpp rcl_interfaces sensor_msgs std_msgs tf2_msgs
 )
 target_link_libraries(livox_laser_simulation_gz
   gz-common5::gz-common5
@@ -54,5 +56,5 @@ install(DIRECTORY models worlds rviz launch px4
   OPTIONAL
 )
 
-ament_export_dependencies(rosidl_default_runtime)
+ament_export_dependencies(rosidl_default_runtime rcl_interfaces)
 ament_package()
